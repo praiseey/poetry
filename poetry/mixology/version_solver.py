@@ -11,7 +11,6 @@ from poetry.core.packages import Package
 from poetry.core.packages import ProjectPackage
 from poetry.core.semver import Version
 from poetry.core.semver import VersionRange
-from poetry.puzzle.provider import Provider
 
 from .failure import SolveFailure
 from .incompatibility import Incompatibility
@@ -40,7 +39,7 @@ class VersionSolver:
     def __init__(
         self,
         root,  # type: ProjectPackage
-        provider,  # type: Provider
+        provider,
         locked=None,  # type: Dict[str, Package]
         use_latest=None,  # type: List[str]
     ):
