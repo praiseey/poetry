@@ -31,8 +31,8 @@ class Installer:
         package,  # type: ProjectPackage
         locker,  # type: Locker
         pool,  # type: Pool
-        installed=None,  # type: (Union[InstalledRepository, None])
-        executor=None,  # type: (Optional[Executor])
+        installed=None,  # type: Union[InstalledRepository, None]
+        executor=None,  # type: Optional[Executor]
     ):
         self._io = io
         self._env = env

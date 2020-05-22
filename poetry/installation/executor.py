@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
-import os
+from __future__ import division
 
+import itertools
+import math
+import os
+import threading
+
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from subprocess import CalledProcessError
 
 from requests import Session
@@ -12,11 +19,20 @@ from poetry.puzzle.operations.install import Install
 from poetry.puzzle.operations.operation import Operation
 from poetry.puzzle.operations.uninstall import Uninstall
 from poetry.puzzle.operations.update import Update
+from poetry.utils._compat import OrderedDict
 from poetry.utils._compat import Path
 from poetry.utils.helpers import safe_rmtree
 
 from .chef import Chef
 from .chooser import Chooser
+
+
+def take(n, iterable):
+    return list(itertools.islice(iterable, n))
+
+
+def chunked(iterable, n):
+    return iter(partial(take, n, iter(iterable)), [])
 
 
 class Executor(object):
@@ -28,9 +44,12 @@ class Executor(object):
         self._verbose = False
         self._chef = Chef(self._env)
         self._chooser = Chooser(self._env)
+        self._executor = ThreadPoolExecutor()
         self._cache_dir = Path(CACHE_DIR) / "artifacts"
         self._total_operations = 0
         self._executed_operations = 0
+        self._lines = OrderedDict()
+        self._lock = threading.Lock()
 
     def disable(self):
         self._enabled = False
@@ -56,13 +75,76 @@ class Executor(object):
         if operations and (self._enabled or self._dry_run):
             self._display_summary(operations)
 
-        for operation in operations:
-            self.execute_operation(operation)
+        # We group operations by priority
 
-    def execute_operation(self, operation):
+        groups = itertools.groupby(operations, key=lambda o: -o.priority)
+        i = 0
+        for _, group in groups:
+            for chunk in chunked(group, 5):
+                tasks = []
+                self._lines = OrderedDict()
+                for operation in chunk:
+                    if id(operation) not in self._lines:
+                        self._lines[id(operation)] = len(self._lines)
+                        self._io.write_line(
+                            "  <fg=blue;options=bold>•</> {message}".format(
+                                message=self.get_operation_message(operation),
+                            ),
+                        )
+
+                for operation in chunk:
+                    tasks.append(
+                        self._executor.submit(self._execute_operation, operation)
+                    )
+                    i += 1
+                    # self.execute_operation(operation)
+
+                [t.result() for t in tasks]
+                import time
+
+                time.sleep(0.1)
+
+    def _write(self, operation, line):
+        self._lock.acquire()
+        diff = len(self._lines) - self._lines[id(operation)]
+
+        self._io.write("\x1b[{}A".format(diff))
+
+        self._io.write("\x1b[2K\r")
+        self._io.write_line(line)
+
+        self._io.write("\x1b[{}B".format(diff))
+        self._lock.release()
+
+    def _execute_operation(self, operation):
         method = operation.job_type
 
+        operation_message = self.get_operation_message(operation)
+        if operation.skipped:
+            if self._verbose and (self._enabled or self._dry_run):
+                self._io.write_line(
+                    "  <fg=blue;options=bold>•</> {message}: <fg=yellow>Skipped</> ({reason})".format(
+                        message=operation_message, reason=operation.skip_reason,
+                    )
+                )
+
+            return
+
+        if not self._enabled or self._dry_run:
+            self._io.write_line(
+                "  <fg=blue;options=bold>•</> {message}".format(
+                    message=operation_message,
+                )
+            )
+
+            return
+
         getattr(self, "_execute_{}".format(method))(operation)
+
+        message = "  <fg=green;options=bold>✓</> {message}".format(
+            message=operation_message,
+        )
+        self._write(operation, message)
 
         self._executed_operations += 1
 
@@ -133,80 +215,21 @@ class Executor(object):
                 else "",
             )
         )
+        self._io.write_line("")
 
     def _execute_install(self, operation):  # type: (Install) -> None
-        if operation.skipped:
-            if self._verbose and (self._enabled or self._dry_run):
-                self._io.write_line(
-                    "  <fg=blue;options=bold>•</> {message}: Skipping".format(
-                        message=self.get_operation_message(operation),
-                    )
-                )
-
-            return
-
-        if not self._enabled or self._dry_run:
-            self._io.write_line(
-                "  <fg=blue;options=bold>•</> {message}".format(
-                    message=self.get_operation_message(operation),
-                )
-            )
-
-            return
-
         self._install(operation)
 
     def _execute_update(self, operation):  # type: (Update) -> None
-        operation_message = self.get_operation_message(operation)
-
-        if operation.skipped:
-            if self._verbose and (self._enabled or self._dry_run):
-                self._io.write_line(
-                    "  <fg=blue;options=bold>•</> {message}: Skipping".format(
-                        message=operation_message,
-                    )
-                )
-
-            return
-
-        if self._enabled or self._dry_run:
-            message = "  <fg=blue;options=bold>•</> {message}".format(
-                message=operation_message,
-            )
-            self._io.write_line(message)
-
-        if not self._enabled:
-            return
-
         self._update(operation)
 
     def _execute_uninstall(self, operation):  # type: (Uninstall) -> None
-        operation_message = self.get_operation_message(operation)
-        if operation.skipped:
-            if self._verbose and (self._enabled or self._dry_run):
-                message = "  <fg=yellow;options=bold>s</> {message}: <fg=yellow>Skipped</> ({reason})".format(
-                    message=operation_message, reason=operation.skip_reason,
-                )
-                self._io.write_line(message)
-
-            return
-
-        if self._enabled or self._dry_run:
-            message = "  <fg=blue;options=bold>•</> {message}".format(
-                message=operation_message,
-            )
-            self._io.write(message)
-
-        if not self._enabled:
-            return
+        message = "  <fg=blue;options=bold>•</> {message}: <info>Removing...</info>".format(
+            message=self.get_operation_message(operation),
+        )
+        self._write(operation, message)
 
         self._remove(operation)
-
-        message = "  <fg=green;options=bold>✓</> {message}".format(
-            message=operation_message,
-        )
-        self._io.overwrite(message)
-        self._io.write_line("")
 
     def _install(self, operation):
         package = operation.package
@@ -225,25 +248,13 @@ class Executor(object):
         message = "  <fg=blue;options=bold>•</> {message}: <info>Installing...</info>".format(
             message=operation_message,
         )
-        if not self._io.output.supports_ansi() or self._io.is_debug():
-            self._io.write_line(message)
-        else:
-            self._io.overwrite(message)
+        self._write(operation, message)
 
         args = ["install", "--no-deps", str(archive)]
         if operation.job_type == "update":
             args.insert(2, "-U")
 
         self.run(*args)
-
-        message = "  <fg=green;options=bold>✓</> {message}".format(
-            message=operation_message,
-        )
-        if not self._io.output.supports_ansi() or self._io.is_debug():
-            self._io.write_line(message)
-        else:
-            self._io.overwrite(message)
-            self._io.write_line("")
 
     def _update(self, operation):
         return self._install(operation)
@@ -359,11 +370,10 @@ class Executor(object):
         message = "  - Installing <info>{}</info> (<comment>{}</comment>)".format(
             package.name, package.full_pretty_version
         )
-        if not self._io.output.supports_ansi() or self._io.is_debug():
+        if not self._io.supports_ansi() or self._io.is_debug():
             self._io.write_line(message)
         else:
             self._io.overwrite(message)
-            self._io.write_line("")
 
         self._install_directory(pkg, from_vcs=True)
 
@@ -383,18 +393,15 @@ class Executor(object):
             message = "  <fg=blue;options=bold>•</> {message}: <info>Downloading...</>".format(
                 message=operation_message,
             )
-            if not self._io.output.supports_ansi() or self._io.is_debug():
+            percent = 0
+            if not self._io.supports_ansi() or self._io.is_debug():
                 self._io.write_line(message)
             else:
-                if wheel_size is None:
-                    progress = self._io.progress_indicator(
-                        fmt="{} <b>{{indicator}}</b>".format(message)
+                if wheel_size is not None:
+                    self._write(
+                        operation,
+                        message + " <c2>{percent}%</c2>".format(percent=percent),
                     )
-                else:
-                    progress = self._io.progress_bar(max=int(wheel_size))
-                    progress.set_format("{} <b>%percent%%</b>".format(message))
-
-                progress.start()
 
             done = 0
             with archive.open("wb") as f:
@@ -404,11 +411,14 @@ class Executor(object):
 
                     done += len(chunk)
 
-                    if self._io.output.supports_ansi() or self._io.is_debug():
-                        if wheel_size is None:
-                            progress.advance()
-                        else:
-                            progress.set_progress(done)
+                    if self._io.supports_ansi() or self._io.is_debug():
+                        if wheel_size is not None:
+                            percent = int(math.floor(done / int(wheel_size) * 100))
+                            self._write(
+                                operation,
+                                message
+                                + " <c2>{percent}%</c2>".format(percent=percent),
+                            )
 
                     f.write(chunk)
 
